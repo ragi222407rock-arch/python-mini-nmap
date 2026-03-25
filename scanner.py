@@ -216,14 +216,13 @@ class PortScanner:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(self.timeout)
-                result = s.connect_ex((ip, port))
-                if result == 0:
-                    return "open"
-                elif result in (111, 10061): # Connection refused
-                    return "closed"
-                else:
-                    return "filtered"
-        except (socket.timeout, OSError):
+                s.connect((ip, port))
+                return "open"
+        except socket.timeout:
+            return "filtered"
+        except ConnectionRefusedError:
+            return "closed"
+        except OSError:
             return "filtered"
 
     def udp_scan(self, ip: str, port: int) -> str:
@@ -287,8 +286,9 @@ class PortScanner:
                 
             state_color = Fore.GREEN if 'open' in res['state'] else (Fore.RED if res['state'] == 'closed' else Fore.YELLOW)
             banner_text = f" -> {res['banner']}" if res['banner'] else ""
+            port_proto = f"{res['port']}/{self.mode}"
             
-            print(f"{res['port']:<10} | {state_color}{res['state']:<15}{Style.RESET_ALL} | {res['service']:<15} {banner_text}")
+            print(f"{port_proto:<10} | {state_color}{res['state']:<15}{Style.RESET_ALL} | {res['service']:<15} {banner_text}")
 
     def run(self):
         print(f"{Style.BRIGHT}{Fore.CYAN}Starting Mini Nmap Python Scanner")
@@ -418,7 +418,7 @@ def main():
     parser.add_argument('-t', '--target', required=True, help='Target IP, hostname, or CIDR (e.g. 192.168.1.1, example.com, 10.0.0.0/24)')
     parser.add_argument('-p', '--ports', default='common', help='Ports to scan: "1-1024", "22,80,443", or "common" (default: common)')
     parser.add_argument('--threads', type=int, default=100, help='Number of threads (default: 100)')
-    parser.add_argument('--timeout', type=float, default=1.0, help='Timeout per port in seconds (default: 1.0)')
+    parser.add_argument('--timeout', type=float, default=2.0, help='Timeout per port in seconds (default: 2.0)')
     parser.add_argument('--mode', choices=['tcp', 'syn', 'udp'], default='tcp', help='Scan mode (default: tcp)')
     parser.add_argument('-o', '--output', help='Output file to export results (e.g. results.json or results.csv)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output (shows closed/filtered ports)')
