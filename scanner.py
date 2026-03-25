@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Python Mini Nmap - A lightweight port scanner inspired by Nmap.
-Author: Mini Nmap Project
 Usage: python3 scanner.py -t scanme.nmap.org -Pn
+       python3 scanner.py -t 192.168.1.1 -p 1-1024 --mode tcp -v
 """
 
 import argparse
 import socket
+import select
 import struct
 import time
 import json
@@ -19,197 +20,171 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Tuple
 
-# ─── Color support ───────────────────────────────────────────────────────────
+# ── Colour support ────────────────────────────────────────────────────────────
 try:
     from colorama import init, Fore, Style
     init(autoreset=True)
 except ImportError:
-    class _Dummy:
+    class _D:
         def __getattr__(self, _): return ""
-    Fore = Style = _Dummy()
+    Fore = Style = _D()
 
-# ─── Progress bar support ─────────────────────────────────────────────────────
+# ── Progress bar ──────────────────────────────────────────────────────────────
 try:
     from tqdm import tqdm
-    TQDM_AVAILABLE = True
+    TQDM = True
 except ImportError:
-    TQDM_AVAILABLE = False
+    TQDM = False
 
-# ─── Well-known port → service name mapping ───────────────────────────────────
-COMMON_SERVICES: Dict[int, str] = {
-    20: "ftp-data",    21: "ftp",          22: "ssh",          23: "telnet",
-    25: "smtp",        53: "domain",       67: "dhcps",        68: "dhcpc",
-    69: "tftp",        80: "http",         110: "pop3",        111: "rpcbind",
-    119: "nntp",       123: "ntp",         135: "msrpc",       137: "netbios-ns",
-    138: "netbios-dgm",139: "netbios-ssn", 143: "imap",        161: "snmp",
-    162: "snmptrap",   389: "ldap",        443: "https",       445: "microsoft-ds",
-    465: "smtps",      500: "isakmp",      514: "syslog",      587: "submission",
-    636: "ldaps",      873: "rsync",       993: "imaps",       995: "pop3s",
-    1080: "socks",     1194: "openvpn",    1433: "ms-sql-s",   1434: "ms-sql-m",
-    1521: "oracle",    1723: "pptp",       2049: "nfs",        3128: "squid-http",
-    3306: "mysql",     3389: "ms-wbt-server", 5432: "postgresql", 5900: "vnc",
-    5985: "wsman",     6379: "redis",      8000: "http-alt",   8080: "http-proxy",
-    8443: "https-alt", 8888: "sun-answerbook", 9000: "cslistener", 27017: "mongod",
+# ── Service map ───────────────────────────────────────────────────────────────
+SERVICES: Dict[int, str] = {
+    20:"ftp-data", 21:"ftp", 22:"ssh", 23:"telnet", 25:"smtp",
+    53:"dns", 67:"dhcp", 68:"dhcp", 69:"tftp", 80:"http",
+    110:"pop3", 111:"rpcbind", 119:"nntp", 123:"ntp", 135:"msrpc",
+    137:"netbios-ns", 138:"netbios-dgm", 139:"netbios-ssn", 143:"imap",
+    161:"snmp", 162:"snmptrap", 389:"ldap", 443:"https", 445:"smb",
+    465:"smtps", 500:"isakmp", 514:"syslog", 587:"submission",
+    636:"ldaps", 873:"rsync", 993:"imaps", 995:"pop3s",
+    1080:"socks", 1194:"openvpn", 1433:"mssql", 1434:"mssql-m",
+    1521:"oracle", 1723:"pptp", 2049:"nfs", 3128:"squid",
+    3306:"mysql", 3389:"rdp", 5432:"postgresql", 5900:"vnc",
+    5985:"winrm", 6379:"redis", 8000:"http-alt", 8080:"http-proxy",
+    8443:"https-alt", 8888:"http-alt2", 9000:"cslistener", 27017:"mongodb",
 }
 
-# Top 100 ports to scan by default (like nmap default scan)
-TOP_100_PORTS = [
-    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 179, 199, 443, 445,
-    465, 514, 515, 587, 631, 636, 646, 873, 993, 995, 1025, 1026, 1027,
-    1028, 1029, 1110, 1433, 1720, 1723, 1755, 1900, 2000, 2001, 2049, 2121,
-    2717, 3000, 3128, 3306, 3389, 3986, 4899, 5000, 5009, 5051, 5060, 5101,
-    5190, 5357, 5432, 5631, 5666, 5800, 5900, 6000, 6001, 6646, 7070, 8000,
-    8008, 8009, 8080, 8081, 8443, 8888, 9100, 9999, 10000, 32768, 49152,
-    49153, 49154, 49155, 49156, 49157, 27017, 6379, 5985, 11211, 1521, 1434,
-    500, 4500, 1194, 161, 69, 123, 162, 137, 138, 67, 68
-]
+TOP100 = sorted({
+    21,22,23,25,53,80,110,111,135,139,143,179,199,443,445,
+    465,514,515,587,631,636,873,993,995,1025,1080,1433,1720,
+    1723,2049,2121,3000,3128,3306,3389,5000,5432,5900,6379,
+    8000,8008,8080,8081,8443,8888,9100,9999,10000,27017,
+    137,138,67,69,123,161,162,500,4500,
+})
 
 
 class PortScanner:
-    """Main port scanner class. Handles all scanning modes and result output."""
-
-    def __init__(
-        self,
-        targets: List[str],
-        ports: List[int],
-        mode: str,
-        threads: int,
-        timeout: float,
-        verbose: bool,
-        output_file: Optional[str],
-        no_ping: bool = False,
-    ):
-        self.targets = targets
-        self.ports = ports
-        self.mode = mode.lower()
-        self.threads = threads
-        self.timeout = timeout
-        self.verbose = verbose
+    def __init__(self, targets, ports, mode, threads, timeout,
+                 verbose, output_file, no_ping=False):
+        self.targets     = targets
+        self.ports       = ports
+        self.mode        = mode.lower()
+        self.threads     = threads
+        self.timeout     = timeout
+        self.verbose     = verbose
         self.output_file = output_file
-        self.no_ping = no_ping
+        self.no_ping     = no_ping
 
-        # Thread-safe counters
-        self._lock = threading.Lock()
+        self._lock        = threading.Lock()
         self.total_scanned = 0
-        self.open_count = 0
-
-        # Results store: {ip: [{"port": int, "state": str, "service": str, "banner": str}]}
+        self.open_count    = 0
         self.results: Dict[str, List[Dict]] = {}
-        self.scan_start_time = 0.0
-        self.scan_end_time = 0.0
+        self.t0 = self.t1 = 0.0
 
-    # ── Service resolution ────────────────────────────────────────────────────
-    def resolve_service(self, port: int) -> str:
-        """Attempt OS service lookup, fall back to our dictionary."""
+    # ─── Service name ─────────────────────────────────────────────────────────
+    def _service(self, port: int) -> str:
         proto = "udp" if self.mode == "udp" else "tcp"
         try:
             return socket.getservbyport(port, proto)
         except OSError:
-            return COMMON_SERVICES.get(port, "unknown")
+            return SERVICES.get(port, "unknown")
 
-    # ── Banner grabbing ───────────────────────────────────────────────────────
-    def banner_grab(self, ip: str, port: int) -> str:
-        """Try to grab a service banner from an open TCP port."""
+    # ─── Banner grab ──────────────────────────────────────────────────────────
+    def _banner(self, ip: str, port: int) -> str:
         if self.mode == "udp":
             return ""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(self.timeout)
+                s.settimeout(max(self.timeout, 2.0))
                 s.connect((ip, port))
-                # HTTP-style probe triggers most services to respond
-                s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
-                raw = s.recv(2048).decode("utf-8", errors="ignore").strip()
-                if not raw:
-                    # Fallback: blank line (triggers SSH, FTP, SMTP greetings)
-                    s.sendall(b"\r\n")
-                    raw = s.recv(1024).decode("utf-8", errors="ignore").strip()
-                # Prefer the Server: header if present
-                for line in raw.splitlines():
+                # Generic probe (triggers HTTP / SSH / FTP / SMTP greetings)
+                try:
+                    s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+                except Exception:
+                    pass
+                raw = b""
+                try:
+                    raw = s.recv(2048)
+                except Exception:
+                    pass
+                text = raw.decode("utf-8", errors="ignore").strip()
+                for line in text.splitlines():
                     if line.lower().startswith("server:"):
                         return line.strip()[:80]
-                return raw.splitlines()[0][:80] if raw else ""
+                return text.splitlines()[0][:80] if text else ""
         except Exception:
             return ""
 
-    # ── Ping & OS fingerprint ─────────────────────────────────────────────────
-    def ping_host(self, ip: str) -> Tuple[bool, str]:
-        """
-        Ping a host once.  Returns (is_alive, os_guess).
-        OS guess is based purely on TTL value (rough heuristic).
-        """
-        sys_name = platform.system().lower()
-        if sys_name == "windows":
-            cmd = ["ping", "-n", "1", "-w", str(int(self.timeout * 1000)), ip]
-        else:
-            cmd = ["ping", "-c", "1", "-W", str(max(1, int(self.timeout))), ip]
+    # ─── Ping / OS fingerprint ─────────────────────────────────────────────────
+    def _ping(self, ip: str) -> Tuple[bool, str]:
+        sys = platform.system().lower()
+        cmd = (["ping","-n","1","-w",str(int(self.timeout*1000)),ip]
+               if sys == "windows"
+               else ["ping","-c","1","-W",str(max(1,int(self.timeout))),ip])
         try:
-            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, universal_newlines=True)
-            output_upper = output.upper()
-            if "TTL=" in output_upper:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT,
+                                          universal_newlines=True)
+            if "ttl=" in out.lower():
                 ttl = None
-                for token in output.split():
-                    if "TTL=" in token.upper():
-                        try:
-                            ttl = int(token.split("=")[1].strip().rstrip(")"))
-                        except (ValueError, IndexError):
-                            pass
-                if ttl is not None:
-                    if ttl <= 64:
-                        return True, "Linux/Unix (TTL≤64)"
-                    elif ttl <= 128:
-                        return True, "Windows (TTL≤128)"
-                    else:
-                        return True, "Network/Router (TTL≤255)"
+                for tok in out.split():
+                    if "ttl=" in tok.lower():
+                        try: ttl = int(tok.split("=")[1].strip().rstrip(")"))
+                        except: pass
+                if ttl:
+                    if   ttl <= 64:  return True, "Linux/Unix (TTL≤64)"
+                    elif ttl <= 128: return True, "Windows (TTL≤128)"
+                    else:            return True, "Network device (TTL≤255)"
                 return True, "Unknown OS"
             return False, ""
         except subprocess.CalledProcessError:
             return False, ""
         except FileNotFoundError:
-            # ping not available – treat as alive so scan still runs
-            return True, "Unknown OS (ping unavailable)"
+            return True, "(ping not available)"
 
-    # ── TCP Connect scan ──────────────────────────────────────────────────────
-    def tcp_connect_scan(self, ip: str, port: int) -> str:
-        """
-        Full TCP 3-way handshake.
-        Returns: 'open', 'closed', or 'filtered'
-        """
+    # ─── TCP Connect via non-blocking socket + select() ────────────────────────
+    # This is the most reliable cross-platform method; avoids exception-based
+    # false-negatives seen with blocking connect() on some Linux kernels.
+    def _tcp_connect(self, ip: str, port: int) -> str:
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(self.timeout)
-                s.connect((ip, port))
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setblocking(False)
+            err = s.connect_ex((ip, port))
+            # err == EINPROGRESS (115 Linux / 10035 Windows) means connecting
+            # err == 0 means instantly connected (loopback / LAN)
+            if err not in (0, 115, 10035):
+                s.close()
+                return "closed"      # immediate hard refusal
+
+            # Wait up to `timeout` seconds for the socket to become writable
+            ready = select.select([], [s], [s], self.timeout)
+            if not ready[1] and not ready[2]:
+                s.close()
+                return "filtered"    # real timeout — firewall dropping packets
+
+            # Read the actual connection result
+            err2 = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            s.close()
+            if err2 == 0:
                 return "open"
-        except socket.timeout:
-            return "filtered"
-        except ConnectionRefusedError:
-            return "closed"
-        except OSError as e:
-            # errno 111 = Connection refused (Linux), errno 10061 = Windows
-            if hasattr(e, "errno") and e.errno in (111, 10061):
+            elif err2 in (111, 10061):   # ECONNREFUSED
                 return "closed"
+            else:
+                return "filtered"
+        except Exception:
             return "filtered"
 
-    # ── TCP SYN (half-open) scan ──────────────────────────────────────────────
-    def tcp_syn_scan(self, ip: str, port: int) -> str:
-        """
-        Half-open SYN scan using raw sockets. Requires root/Administrator.
-        Falls back gracefully if permission is denied.
-        """
+    # ─── TCP SYN half-open scan (raw sockets, needs root) ─────────────────────
+    def _tcp_syn(self, ip: str, port: int) -> str:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
             s.settimeout(self.timeout)
-            source_ip = socket.gethostbyname(socket.gethostname())
-            packet = self._build_syn_packet(source_ip, ip, port)
-            s.sendto(packet, (ip, 0))
+            src = socket.gethostbyname(socket.gethostname())
+            pkt = self._build_syn(src, ip, port)
+            s.sendto(pkt, (ip, 0))
             try:
                 data = s.recvfrom(1024)[0]
-                # IP header is 20 bytes; TCP flags are at byte 33
                 if len(data) > 33:
                     flags = data[33]
-                    if flags & 0x12 == 0x12:   # SYN-ACK
-                        return "open"
-                    elif flags & 0x14 == 0x14: # RST-ACK
-                        return "closed"
+                    if flags & 0x12 == 0x12: return "open"
+                    if flags & 0x14 == 0x14: return "closed"
                 return "filtered"
             except socket.timeout:
                 return "filtered"
@@ -218,212 +193,191 @@ class PortScanner:
         except PermissionError:
             return "error_permission"
         except OSError as e:
-            if hasattr(e, "errno") and e.errno == 10013:
-                return "error_permission"
+            if getattr(e,"errno",None) == 10013: return "error_permission"
             return "filtered"
 
-    def _build_syn_packet(self, src_ip: str, dst_ip: str, dst_port: int) -> bytes:
-        """Construct a raw TCP SYN packet with correct checksum."""
-        src_port = 54321
-        seq = ack = 0
-        doff = 5
-        flags = 0x02  # SYN
-        window = socket.htons(65535)
-        urg = check = 0
-        offset_res = (doff << 4)
+    def _build_syn(self, src_ip, dst_ip, dst_port) -> bytes:
+        sp, seq, ack = 54321, 0, 0
+        doff, flags, win, chk, urg = 5, 0x02, socket.htons(65535), 0, 0
+        off = doff << 4
+        hdr = struct.pack("!HHLLBBHHH", sp, dst_port, seq, ack, off, flags, win, chk, urg)
+        pseudo = (struct.pack("!4s4sBBH",
+                  socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+                  0, socket.IPPROTO_TCP, len(hdr)) + hdr)
+        def chksum(d):
+            s = sum((d[i]<<8)+d[i+1] for i in range(0,len(d)-1,2))
+            if len(d)%2: s += d[-1]<<8
+            s = (s>>16)+(s&0xFFFF)
+            return ~(s+(s>>16))&0xFFFF
+        c = chksum(pseudo)
+        return struct.pack("!HHLLBBHHH", sp, dst_port, seq, ack, off, flags, win, c, urg)
 
-        # Pack without checksum first
-        tcp_hdr = struct.pack("!HHLLBBHHH", src_port, dst_port, seq, ack,
-                              offset_res, flags, window, check, urg)
-
-        # Pseudo-header for checksum calculation
-        src_addr = socket.inet_aton(src_ip)
-        dst_addr = socket.inet_aton(dst_ip)
-        pseudo = struct.pack("!4s4sBBH", src_addr, dst_addr, 0,
-                             socket.IPPROTO_TCP, len(tcp_hdr))
-
-        def chksum(data: bytes) -> int:
-            s = 0
-            for i in range(0, len(data) - 1, 2):
-                s += (data[i] << 8) + data[i + 1]
-            if len(data) % 2:
-                s += data[-1] << 8
-            s = (s >> 16) + (s & 0xFFFF)
-            return ~(s + (s >> 16)) & 0xFFFF
-
-        checksum = chksum(pseudo + tcp_hdr)
-        return struct.pack("!HHLLBBHHH", src_port, dst_port, seq, ack,
-                           offset_res, flags, window, checksum, urg)
-
-    # ── UDP scan ──────────────────────────────────────────────────────────────
-    def udp_scan(self, ip: str, port: int) -> str:
-        """
-        Basic UDP probe.
-        Returns 'open', 'open|filtered', or 'closed'.
-        """
+    # ─── UDP scan ──────────────────────────────────────────────────────────────
+    def _udp(self, ip: str, port: int) -> str:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(self.timeout)
-                s.sendto(b"\x00" * 8, (ip, port))
+                s.sendto(b"\x00"*8, (ip, port))
                 try:
-                    s.recvfrom(1024)
-                    return "open"
+                    s.recvfrom(1024); return "open"
                 except socket.timeout:
                     return "open|filtered"
                 except ConnectionResetError:
-                    # ICMP port-unreachable received → port is closed
                     return "closed"
         except Exception:
             return "filtered"
 
-    # ── Per-port dispatcher ───────────────────────────────────────────────────
-    def scan_port(self, ip: str, port: int) -> Optional[Dict]:
-        """Scan a single port and return a result dict, or None if not reportable."""
-        if self.mode == "tcp":
-            state = self.tcp_connect_scan(ip, port)
-        elif self.mode == "syn":
-            state = self.tcp_syn_scan(ip, port)
-            if state == "error_permission":
-                return {"error": "SYN scan requires root/Administrator privileges."}
-        else:  # udp
-            state = self.udp_scan(ip, port)
+    # ─── Per-port worker ───────────────────────────────────────────────────────
+    def _scan_port(self, ip: str, port: int) -> Optional[Dict]:
+        if   self.mode == "tcp": state = self._tcp_connect(ip, port)
+        elif self.mode == "syn": state = self._tcp_syn(ip, port)
+        else:                    state = self._udp(ip, port)
 
-        # Thread-safe counter update
+        if state == "error_permission":
+            return {"error": "SYN scan needs root. Run: sudo python3 scanner.py ..."}
+
         with self._lock:
             self.total_scanned += 1
             if "open" in state:
                 self.open_count += 1
 
-        service = self.resolve_service(port)
-        banner = ""
-        if state == "open" and self.mode != "udp":
-            banner = self.banner_grab(ip, port)
+        svc = self._service(port)
+        banner = self._banner(ip, port) if state == "open" and self.mode != "udp" else ""
 
         if "open" in state:
-            return {"port": port, "state": state, "service": service, "banner": banner}
+            return {"port":port, "state":state, "service":svc, "banner":banner}
         if self.verbose:
-            return {"port": port, "state": state, "service": service, "banner": ""}
-        return None  # closed/filtered hidden by default
+            return {"port":port, "state":state, "service":svc, "banner":""}
+        return None
 
-    # ── Result display ────────────────────────────────────────────────────────
-    def display_target_result(self, ip: str, results: List[Dict], os_guess: str):
-        """Print a well-formatted, Nmap-style table for one target."""
-        print(f"\n{Style.BRIGHT}{Fore.BLUE}{'─'*60}")
-        print(f"{Style.BRIGHT}{Fore.CYAN}  Nmap-style Scan Report for {ip}")
-        if os_guess:
-            print(f"{Style.BRIGHT}  OS Fingerprint (TTL): {Fore.YELLOW}{os_guess}")
-        print(f"{Fore.BLUE}{'─'*60}{Style.RESET_ALL}")
+    # ─── Display ───────────────────────────────────────────────────────────────
+    def _display(self, ip: str, rows: List[Dict], os_hint: str):
+        W = 62
+        print(f"\n{Style.BRIGHT}{Fore.CYAN}{'─'*W}")
+        print(f"  Scan results for: {Fore.WHITE}{ip}{Fore.CYAN}  {os_hint}")
+        print(f"{'─'*W}{Style.RESET_ALL}")
 
-        open_results = [r for r in results if "open" in r.get("state", "")]
-        closed_count = sum(1 for r in results if r.get("state") == "closed")
-        filtered_count = sum(1 for r in results if r.get("state") == "filtered")
+        open_rows = [r for r in rows if "open" in r.get("state","")]
+        if not open_rows:
+            closed = sum(1 for r in rows if r.get("state")=="closed")
+            filt   = sum(1 for r in rows if r.get("state")=="filtered")
+            print(f"  {Fore.RED}No open ports found.")
+            if self.verbose:
+                print(f"  {Fore.YELLOW}Closed: {closed}  Filtered: {filt}")
+            print(f"{Fore.CYAN}{'─'*W}{Style.RESET_ALL}")
+            return
 
-        if not open_results:
-            print(f"{Fore.RED}  All {len(self.ports)} scanned ports are closed/filtered.")
-        else:
-            # Header
-            print(f"{Style.BRIGHT}  {'PORT':<12} {'STATE':<12} {'SERVICE':<18} BANNER{Style.RESET_ALL}")
-            print(f"  {'─'*56}")
-            for res in sorted(results, key=lambda r: r["port"]):
-                state = res["state"]
-                if not self.verbose and "open" not in state:
-                    continue
-                port_label = f"{res['port']}/{self.mode}"
-                color = (Fore.GREEN if "open" in state
-                         else Fore.YELLOW if state == "filtered"
-                         else Fore.RED)
-                banner_txt = f"  {res['banner']}" if res["banner"] else ""
-                print(
-                    f"  {port_label:<12} "
-                    f"{color}{state:<12}{Style.RESET_ALL} "
-                    f"{res['service']:<18}"
-                    f"{banner_txt}"
-                )
+        print(f"{Style.BRIGHT}  {'PORT':<13} {'STATE':<11} {'SERVICE':<16} BANNER{Style.RESET_ALL}")
+        print(f"  {'─'*58}")
+
+        for r in sorted(rows, key=lambda x: x["port"]):
+            st = r["state"]
+            if not self.verbose and "open" not in st:
+                continue
+            label = f"{r['port']}/{self.mode}"
+            col   = (Fore.GREEN if "open" in st else
+                     Fore.YELLOW if st=="filtered" else Fore.RED)
+            btext = f"  {r['banner']}" if r.get("banner") else ""
+            print(f"  {label:<13} {col}{st:<11}{Style.RESET_ALL} {r['service']:<16}{btext}")
 
         if self.verbose:
-            print(f"\n  {Fore.YELLOW}Closed: {closed_count}  Filtered: {filtered_count}{Style.RESET_ALL}")
-        print(f"{Fore.BLUE}{'─'*60}{Style.RESET_ALL}")
+            closed = sum(1 for r in rows if r.get("state")=="closed")
+            filt   = sum(1 for r in rows if r.get("state")=="filtered")
+            print(f"\n  {Fore.YELLOW}Closed: {closed}  Filtered: {filt}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'─'*W}{Style.RESET_ALL}")
 
-    # ── Main run loop ─────────────────────────────────────────────────────────
+    # ─── Connectivity self-test ────────────────────────────────────────────────
+    def _network_check(self):
+        """Quick check to confirm TCP connections work at all from this machine."""
+        test_targets = [("8.8.8.8", 53), ("1.1.1.1", 53)]
+        for host, port in test_targets:
+            result = self._tcp_connect(host, port)
+            if result == "open":
+                return True
+        return False
+
+    # ─── Main run ─────────────────────────────────────────────────────────────
     def run(self):
-        print(f"\n{Style.BRIGHT}{Fore.CYAN}Starting Mini Nmap Python Scanner")
-        print(f"{Fore.CYAN}Scan mode: {self.mode.upper()}  |  Threads: {self.threads}  |  Timeout: {self.timeout}s  |  Ports: {len(self.ports)}")
-        self.scan_start_time = time.time()
+        print(f"\n{Style.BRIGHT}{Fore.CYAN}Mini Nmap Python Scanner")
+        print(f"Mode: {self.mode.upper()}  Threads: {self.threads}  "
+              f"Timeout: {self.timeout}s  Ports: {len(self.ports)}{Style.RESET_ALL}")
+
+        # Self-test network connectivity
+        print(f"\n{Fore.CYAN}[*] Testing network connectivity...")
+        if self._network_check():
+            print(f"{Fore.GREEN}[+] Network OK — outbound TCP connections are working.")
+        else:
+            print(f"{Fore.RED}[!] WARNING: Cannot reach 8.8.8.8:53 — your network may block outbound connections.")
+            print(f"{Fore.YELLOW}    If on a VM: switch VMware network adapter to BRIDGED mode.")
+            print(f"{Fore.YELLOW}    Continuing scan anyway...\n")
+
         syn_warned = False
+        self.t0 = time.time()
 
         for ip in self.targets:
-            os_guess = ""
+            os_hint = ""
 
-            # ── Host discovery ────────────────────────────────────────────
+            # Host discovery
             if not self.no_ping:
                 print(f"\n{Fore.CYAN}[*] Pinging {ip}...")
-                is_up, os_guess = self.ping_host(ip)
-                if not is_up:
-                    print(f"{Fore.RED}[-] {ip} did not respond to ping. Skipping.")
-                    print(f"{Fore.YELLOW}    Tip: Add -Pn to skip ping and force-scan anyway.")
+                alive, os_hint = self._ping(ip)
+                if not alive:
+                    print(f"{Fore.RED}[-] {ip} did not respond to ping.")
+                    print(f"{Fore.YELLOW}    Add -Pn to skip ping and scan anyway.")
                     continue
-                print(f"{Fore.GREEN}[+] {ip} is UP  ({os_guess})")
+                print(f"{Fore.GREEN}[+] {ip} is UP — {os_hint}")
             else:
-                print(f"\n{Fore.CYAN}[*] -Pn: Skipping ping, forcing scan on {ip}...")
+                print(f"\n{Fore.CYAN}[*] -Pn mode: force-scanning {ip} ...")
 
             self.results[ip] = []
+            host_results: List[Dict] = []
 
-            # ── Port scan ─────────────────────────────────────────────────
-            with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                futures = {executor.submit(self.scan_port, ip, port): port
-                           for port in self.ports}
-
+            # Thread pool scan
+            with ThreadPoolExecutor(max_workers=self.threads) as ex:
+                fmap = {ex.submit(self._scan_port, ip, p): p for p in self.ports}
+                it = (tqdm(as_completed(fmap), total=len(self.ports),
+                           desc=f"  {ip}", unit="port", leave=True, colour="cyan")
+                      if TQDM else as_completed(fmap))
                 try:
-                    if TQDM_AVAILABLE:
-                        completed = tqdm(as_completed(futures),
-                                         total=len(self.ports),
-                                         desc=f"  Scanning {ip}",
-                                         unit="port",
-                                         leave=True,
-                                         colour="cyan")
-                    else:
-                        completed = as_completed(futures)
-
-                    for future in completed:
-                        res = future.result()
+                    for fut in it:
+                        res = fut.result()
                         if res is None:
                             continue
                         if "error" in res:
                             if not syn_warned:
                                 print(f"\n{Fore.RED}[!] {res['error']}")
-                                print(f"{Fore.YELLOW}[!] Falling back to TCP Connect scan.")
                                 self.mode = "tcp"
                                 syn_warned = True
                         else:
                             with self._lock:
-                                self.results[ip].append(res)
-
+                                host_results.append(res)
                 except KeyboardInterrupt:
-                    print(f"\n{Fore.RED}[!] Interrupted. Stopping scan...")
-                    executor.shutdown(wait=False, cancel_futures=True)
+                    print(f"\n{Fore.RED}[!] Interrupted.")
+                    ex.shutdown(wait=False, cancel_futures=True)
                     break
 
-            self.display_target_result(ip, self.results[ip], os_guess)
+            self.results[ip] = host_results
+            self._display(ip, host_results, os_hint)
 
-        self.scan_end_time = time.time()
-        self._print_summary()
+        self.t1 = time.time()
+        self._summary()
         if self.output_file:
-            self._export_results()
+            self._export()
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    def _print_summary(self):
-        duration = self.scan_end_time - self.scan_start_time
-        print(f"\n{Style.BRIGHT}{Fore.CYAN}{'─'*60}")
+    # ─── Summary ──────────────────────────────────────────────────────────────
+    def _summary(self):
+        dur = self.t1 - self.t0
+        print(f"\n{Style.BRIGHT}{Fore.CYAN}{'─'*62}")
         print(f"  Scan Summary")
-        print(f"{'─'*60}{Style.RESET_ALL}")
+        print(f"{'─'*62}{Style.RESET_ALL}")
         print(f"  Hosts Scanned    : {len(self.targets)}")
         print(f"  Total Ports      : {self.total_scanned}")
         print(f"  Open Ports Found : {Fore.GREEN}{self.open_count}{Style.RESET_ALL}")
-        print(f"  Scan Duration    : {duration:.2f}s")
-        print(f"{Fore.CYAN}{'─'*60}{Style.RESET_ALL}\n")
+        print(f"  Scan Duration    : {dur:.2f}s")
+        print(f"{Fore.CYAN}{'─'*62}{Style.RESET_ALL}\n")
 
-    # ── Export ────────────────────────────────────────────────────────────────
-    def _export_results(self):
+    # ─── Export ───────────────────────────────────────────────────────────────
+    def _export(self):
         ext = os.path.splitext(self.output_file)[1].lower()
         try:
             if ext == ".json":
@@ -432,119 +386,96 @@ class PortScanner:
             elif ext == ".csv":
                 with open(self.output_file, "w", newline="") as f:
                     w = csv.writer(f)
-                    w.writerow(["IP", "Port", "Protocol", "State", "Service", "Banner"])
+                    w.writerow(["IP","Port","Protocol","State","Service","Banner"])
                     for ip, rows in self.results.items():
                         for r in rows:
-                            w.writerow([ip, r["port"], self.mode,
-                                        r["state"], r["service"], r["banner"]])
+                            w.writerow([ip,r["port"],self.mode,
+                                        r["state"],r["service"],r.get("banner","")])
             else:
-                print(f"{Fore.RED}[!] Unknown extension '{ext}'. Use .json or .csv")
+                print(f"{Fore.RED}[!] Use .json or .csv extension.")
                 return
-            print(f"{Fore.GREEN}[+] Results saved to {self.output_file}")
-        except Exception as exc:
-            print(f"{Fore.RED}[!] Export failed: {exc}")
+            print(f"{Fore.GREEN}[+] Saved → {self.output_file}")
+        except Exception as e:
+            print(f"{Fore.RED}[!] Export error: {e}")
 
 
-# ─── CLI Helpers ──────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def parse_target(target_str: str) -> List[str]:
-    """Resolve hostname / CIDR to a list of IP strings."""
+def parse_target(s: str) -> List[str]:
     try:
-        if "/" in target_str:
-            net = ipaddress.ip_network(target_str, strict=False)
-            return [str(h) for h in net.hosts()]
-        ip = socket.gethostbyname(target_str)
-        if target_str != ip:
-            print(f"{Fore.CYAN}[*] Resolved {target_str} → {ip}")
+        if "/" in s:
+            return [str(h) for h in ipaddress.ip_network(s, strict=False).hosts()]
+        ip = socket.gethostbyname(s)
+        if ip != s:
+            print(f"{Fore.CYAN}[*] Resolved {s} → {ip}")
         return [ip]
-    except Exception as exc:
-        print(f"{Fore.RED}[!] Could not resolve target '{target_str}': {exc}")
+    except Exception as e:
+        print(f"{Fore.RED}[!] Cannot resolve '{s}': {e}")
         return []
 
 
-def parse_ports(port_str: str) -> List[int]:
-    """Parse port expressions like '22,80,443', '1-1024', 'top100', 'common'."""
-    if port_str.lower() in ("common", "top50"):
-        return sorted(COMMON_SERVICES.keys())
-    if port_str.lower() == "top100":
-        return sorted(set(TOP_100_PORTS))
-
-    ports: set = set()
-    for part in port_str.split(","):
+def parse_ports(s: str) -> List[int]:
+    if s.lower() in ("common", "top50"):
+        return sorted(SERVICES.keys())
+    if s.lower() == "top100":
+        return sorted(TOP100)
+    out: set = set()
+    for part in s.split(","):
         part = part.strip()
         if "-" in part:
             try:
-                lo, hi = map(int, part.split("-", 1))
-                if 1 <= lo <= hi <= 65535:
-                    ports.update(range(lo, hi + 1))
+                lo, hi = map(int, part.split("-",1))
+                if 1<=lo<=hi<=65535: out.update(range(lo, hi+1))
             except ValueError:
-                print(f"{Fore.RED}[!] Invalid range: {part}")
+                print(f"{Fore.RED}[!] Bad range: {part}")
         else:
             try:
                 p = int(part)
-                if 1 <= p <= 65535:
-                    ports.add(p)
+                if 1<=p<=65535: out.add(p)
             except ValueError:
-                print(f"{Fore.RED}[!] Invalid port: {part}")
-    return sorted(ports)
+                print(f"{Fore.RED}[!] Bad port: {part}")
+    return sorted(out)
 
-
-# ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Python Mini Nmap – a lightweight port scanner",
+    p = argparse.ArgumentParser(
+        description="Python Mini Nmap – reliable port scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python3 scanner.py -t scanme.nmap.org -Pn
-  python3 scanner.py -t 192.168.1.1 -p 1-1024 --mode tcp
+  python3 scanner.py -t 192.168.1.1 -p 1-1024 -v
   python3 scanner.py -t 10.0.0.0/24 -p top100 --threads 200 -Pn
-  python3 scanner.py -t example.com -p 22,80,443 -o results.json
-        """,
-    )
-    parser.add_argument("-t", "--target", required=True,
-                        help="IP, hostname, or CIDR (e.g. 192.168.1.1, scanme.nmap.org, 10.0.0.0/24)")
-    parser.add_argument("-p", "--ports", default="common",
-                        help="Ports: '1-1024', '22,80,443', 'common'(top50), 'top100' [default: common]")
-    parser.add_argument("--threads", type=int, default=100,
-                        help="Worker threads [default: 100]")
-    parser.add_argument("--timeout", type=float, default=2.0,
-                        help="Per-port timeout in seconds [default: 2.0]")
-    parser.add_argument("--mode", choices=["tcp", "syn", "udp"], default="tcp",
-                        help="Scan mode [default: tcp]")
-    parser.add_argument("-o", "--output",
-                        help="Save results to file (e.g. out.json or out.csv)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Also show closed/filtered ports")
-    parser.add_argument("-Pn", "--no-ping", action="store_true",
-                        help="Skip ping, treat all hosts as up (use for internet targets)")
-
-    args = parser.parse_args()
+  python3 scanner.py -t example.com -p 22,80,443 -o out.json
+        """)
+    p.add_argument("-t","--target", required=True,
+                   help="IP, hostname, or CIDR  e.g.  scanme.nmap.org")
+    p.add_argument("-p","--ports", default="common",
+                   help="'22,80,443'  '1-1024'  'common'(top50)  'top100'")
+    p.add_argument("--threads", type=int, default=150)
+    p.add_argument("--timeout", type=float, default=2.0,
+                   help="Per-port timeout seconds (default 2)")
+    p.add_argument("--mode", choices=["tcp","syn","udp"], default="tcp")
+    p.add_argument("-o","--output", help="results.json or results.csv")
+    p.add_argument("-v","--verbose", action="store_true",
+                   help="Show closed/filtered ports too")
+    p.add_argument("-Pn","--no-ping", action="store_true",
+                   help="Skip ping — treat all hosts as up")
+    args = p.parse_args()
 
     targets = parse_target(args.target)
-    if not targets:
-        return
-
+    if not targets: return
     ports = parse_ports(args.ports)
     if not ports:
-        print(f"{Fore.RED}[!] No valid ports to scan.")
-        return
+        print(f"{Fore.RED}[!] No valid ports."); return
 
-    PortScanner(
-        targets=targets,
-        ports=ports,
-        mode=args.mode,
-        threads=args.threads,
-        timeout=args.timeout,
-        verbose=args.verbose,
-        output_file=args.output,
-        no_ping=args.no_ping,
-    ).run()
+    PortScanner(targets, ports, args.mode, args.threads,
+                args.timeout, args.verbose, args.output,
+                args.no_ping).run()
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{Fore.RED}[!] Scanner stopped by user.")
+        print(f"\n{Fore.RED}[!] Stopped.")
