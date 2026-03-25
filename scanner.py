@@ -39,7 +39,7 @@ COMMON_SERVICES = {
 }
 
 class PortScanner:
-    def __init__(self, targets: List[str], ports: List[int], mode: str, threads: int, timeout: float, verbose: bool, output_file: Optional[str]):
+    def __init__(self, targets: List[str], ports: List[int], mode: str, threads: int, timeout: float, verbose: bool, output_file: Optional[str], no_ping: bool = False):
         self.targets = targets
         self.ports = ports
         self.mode = mode.lower()
@@ -47,6 +47,7 @@ class PortScanner:
         self.timeout = timeout
         self.verbose = verbose
         self.output_file = output_file
+        self.no_ping = no_ping
         
         self.results = {}  # Format: {ip: [{"port": port, "state": state, "service": service, "banner": banner}]}
         self.scan_start_time = 0
@@ -74,7 +75,12 @@ class PortScanner:
                 if not banner:
                     s.sendall(b"\r\n")
                     banner = s.recv(1024).decode('utf-8', errors='ignore').strip()
-                return banner.split('\n')[0][:50]
+                
+                lines = banner.split('\n')
+                for line in lines:
+                    if line.lower().startswith('server:'):
+                        return line.strip()[:60]
+                return lines[0][:60] if lines else ""
         except Exception:
             return ""
 
@@ -291,15 +297,20 @@ class PortScanner:
         syn_warned = False
 
         for ip in self.targets:
-            # Ping sweep before scanning
-            print(f"\n{Fore.CYAN}[*] Pinging {ip}...")
-            is_up, os_guess = self.ping_host(ip)
-            
-            if not is_up:
-                print(f"{Fore.RED}[-] Host {ip} seems down. Skipping (or use verbose to ignore).")
-                continue
+            os_guess = None
+            if not self.no_ping:
+                # Ping sweep before scanning
+                print(f"\n{Fore.CYAN}[*] Pinging {ip}...")
+                is_up, os_guess = self.ping_host(ip)
                 
-            print(f"{Fore.GREEN}[+] Host {ip} is UP.")
+                if not is_up:
+                    print(f"{Fore.RED}[-] Host {ip} seems down. Skipping.")
+                    print(f"{Fore.YELLOW}[!] Tip: Use -Pn flag to skip ping and force scan if host is blocking ICMP.")
+                    continue
+                    
+                print(f"{Fore.GREEN}[+] Host {ip} is UP.")
+            else:
+                print(f"\n{Fore.CYAN}[*] Skipping ping (-Pn). Forcing scan on {ip}...")
             
             self.results[ip] = []
             
@@ -411,6 +422,7 @@ def main():
     parser.add_argument('--mode', choices=['tcp', 'syn', 'udp'], default='tcp', help='Scan mode (default: tcp)')
     parser.add_argument('-o', '--output', help='Output file to export results (e.g. results.json or results.csv)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output (shows closed/filtered ports)')
+    parser.add_argument('-Pn', '--no-ping', action='store_true', help='Skip ping sweep and force target scan')
 
     args = parser.parse_args()
 
@@ -433,7 +445,8 @@ def main():
         threads=args.threads,
         timeout=args.timeout,
         verbose=args.verbose,
-        output_file=args.output
+        output_file=args.output,
+        no_ping=args.no_ping
     )
     scanner.run()
 
