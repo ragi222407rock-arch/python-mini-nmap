@@ -14,8 +14,15 @@ A custom Python-based network port scanner with dynamic features inspired by Nma
 ## 🛠️ Installation
 
 Make sure you have python installed natively on your machine.
+Users on Kali Linux/Ubuntu can easily fetch and run this tool without issues.
 
-1. Install the required dependencies (`colorama` and `tqdm` for UI tracking):
+1. First, clone the repository to your system:
+```bash
+git clone https://github.com/ragi222407rock-arch/python-mini-nmap.git
+cd python-mini-nmap
+```
+
+2. Install the required dependencies (`colorama` and `tqdm` for UI tracking):
 ```bash
 pip install -r requirements.txt
 ```
